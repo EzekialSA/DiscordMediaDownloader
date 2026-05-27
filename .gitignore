@@ -1,0 +1,7 @@
+.env
+output/
+downloads/
+*.json.tmp
+export.csv
+download.csv
+__pycache__/

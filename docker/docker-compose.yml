@@ -1,0 +1,11 @@
+services:
+  discord-downloader:
+    build: .
+    env_file: .env
+    volumes:
+      - discord-config:/config
+      - discord-output:/output
+
+volumes:
+  discord-config:
+  discord-output:

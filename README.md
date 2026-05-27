@@ -1,16 +1,47 @@
 # DiscordMediaDownloader
-Downloads all .png, .jpg, .jpeg, .gif, .webm, and .mp4 files from a discord channel
-Great for archiving memes
 
-## Media downloader script usage
-- Use [DiscordChatExporter](https://github.com/Tyrrrz/DiscordChatExporter) to export a .json file of the desired text channel(s).
-- Move the .json file into the same directory as main.go and rename the .json file "messages.json".
-- Run the go command with "go run main.go" in the directory.
-- All files will be saved to the downloads folder found in the repository directory. Duplicate files will have _1, _2, _3, etc added to the name.
+Automated Discord channel media archiver. Uses [DiscordChatExporter](https://github.com/Tyrrrz/DiscordChatExporter) CLI to export messages and downloads all media attachments (.png, .jpg, .jpeg, .gif, .mp4, .webm, .webp, .mov).
 
-## Bot usage (optional)
-- Use the discord developer portal to create a new application, and then add a bot to it.
-- Generate a OAuth2 URL in the developer portal with permissions to read messages, manage messages, view channels, and view message history.
-- Add your bots token to bot.py
-- Make sure you have discord.py installed and then run the bot with "python bot.py"
-- In a given channel, type "-remove " followed by a list of message ids seperated by any sort of character.
+## How It Works
+
+1. **First run** — lists all your guilds/channels and writes `export.csv`
+2. **You curate** — copy entries from `export.csv` into `download.csv` for channels you want
+3. **Subsequent runs** — exports messages as JSON (incremental if file exists) then downloads media
+
+## Windows Setup
+
+1. Download [DiscordChatExporter CLI (win-x64)](https://github.com/Tyrrrz/DiscordChatExporter/releases) and extract
+2. Copy `.env.example` to `.env` and set your `DISCORD_TOKEN` and `DCE_PATH`
+3. Install dependencies: `pip install requests python-dotenv`
+4. Run: `python discord_downloader.py`
+
+## Docker Setup (Linux)
+
+```bash
+cd docker
+cp .env.example .env
+# Edit .env with your DISCORD_TOKEN
+docker compose up --build
+```
+
+### Volumes
+
+| Volume | Container Path | Purpose |
+|--------|---------------|---------|
+| `discord-config` | `/config` | Config files (`export.csv`, `download.csv`) |
+| `discord-output` | `/output` | JSON exports and downloaded media |
+
+## CSV Format
+
+```
+GuildName,GuildID,ChannelName,ChannelID
+NewAngels18,1479095332427272294,HOLYTEXTSget-id-verified,1485526215627505784
+NewAngels18,1479095332427272294,HOLYTEXTSanswer-questions,1479234650034671838
+```
+
+Names are sanitized (only alphanumeric, hyphens, underscores kept).
+
+## Legacy
+
+- `main.go` — Original Go media downloader (reads `messages.json` directly)
+- `bot.py` — Original Discord bot for message deletion
