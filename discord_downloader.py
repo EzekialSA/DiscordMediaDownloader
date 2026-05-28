@@ -28,17 +28,34 @@ except ImportError:
     sys.exit(1)
 
 # Try to load .env file if python-dotenv is available
+SCRIPT_DIR = Path(__file__).resolve().parent
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(SCRIPT_DIR / ".env")
 except ImportError:
-    pass
+    # Fallback: manually parse .env file
+    env_file = SCRIPT_DIR / ".env"
+    if env_file.exists():
+        with open(env_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    value = value.strip()
+                    # Strip surrounding quotes
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                        value = value[1:-1]
+                    os.environ.setdefault(key.strip(), value)
 
 # Configuration from environment
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
-DCE_PATH = os.environ.get("DCE_PATH", r".\DiscordChatExporter.Cli.exe")
-CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "."))
-OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "./output"))
+DCE_PATH = os.environ.get("DCE_PATH", str(SCRIPT_DIR / "DiscordChatExporter.Cli.exe"))
+CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(SCRIPT_DIR)))
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", str(SCRIPT_DIR / "output")))
+
+# Resolve relative DCE_PATH against SCRIPT_DIR
+if not Path(DCE_PATH).is_absolute():
+    DCE_PATH = str(SCRIPT_DIR / DCE_PATH)
 
 MEDIA_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".mp4", ".webm", ".webp", ".mov"}
 
@@ -48,19 +65,25 @@ def sanitize_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9\-_]", "", name)
 
 
-def run_dce(args: list[str]) -> str:
-    """Run DiscordChatExporter CLI with given arguments."""
+def run_dce(args: list[str]) -> tuple[bool, str]:
+    """Run DiscordChatExporter CLI with given arguments. Returns (success, stdout)."""
     cmd = [DCE_PATH] + args
+    if not Path(DCE_PATH).exists():
+        print(f"ERROR: DCE executable not found at: {DCE_PATH}", file=sys.stderr)
+        sys.exit(1)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"DCE error: {result.stderr}", file=sys.stderr)
-        sys.exit(1)
-    return result.stdout
+        print(f"  DCE error: {result.stderr.strip()}", file=sys.stderr)
+        return (False, "")
+    return (True, result.stdout)
 
 
 def get_guilds() -> list[tuple[str, str]]:
     """Get list of (guild_id, guild_name) tuples."""
-    output = run_dce(["guilds", "-t", DISCORD_TOKEN])
+    success, output = run_dce(["guilds", "-t", DISCORD_TOKEN])
+    if not success:
+        print("ERROR: Failed to retrieve guilds.", file=sys.stderr)
+        sys.exit(1)
     guilds = []
     for line in output.strip().splitlines():
         parts = line.split("|")
@@ -73,7 +96,10 @@ def get_guilds() -> list[tuple[str, str]]:
 
 def get_channels(guild_id: str) -> list[tuple[str, str]]:
     """Get list of (channel_id, channel_name) tuples for a guild."""
-    output = run_dce(["channels", "--token", DISCORD_TOKEN, "--guild", guild_id])
+    success, output = run_dce(["channels", "--token", DISCORD_TOKEN, "--guild", guild_id])
+    if not success:
+        print(f"  WARNING: Failed to retrieve channels for guild {guild_id}, skipping.")
+        return []
     channels = []
     for line in output.strip().splitlines():
         parts = line.split("|")
@@ -145,8 +171,8 @@ def get_last_message_id(json_path: Path) -> str | None:
     return None
 
 
-def export_channel(entry: dict) -> Path:
-    """Export channel messages to JSON, appending if file exists."""
+def export_channel(entry: dict) -> Path | None:
+    """Export channel messages to JSON, appending if file exists. Returns None on failure."""
     filename = f"{entry['guild_name']}_{entry['channel_name']}.json"
     json_path = OUTPUT_DIR / filename
 
@@ -162,7 +188,13 @@ def export_channel(entry: dict) -> Path:
                 "-o", str(tmp_path),
                 "--after", last_id,
             ]
-            run_dce(args)
+            success, _ = run_dce(args)
+
+            if not success:
+                print(f"  WARNING: Failed to export channel {entry['channel_name']}, skipping.")
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                return json_path  # Still return existing JSON for downloads
 
             if tmp_path.exists() and tmp_path.stat().st_size > 0:
                 try:
@@ -196,7 +228,10 @@ def export_channel(entry: dict) -> Path:
             "-f", "Json",
             "-o", str(json_path),
         ]
-        run_dce(args)
+        success, _ = run_dce(args)
+        if not success:
+            print(f"  WARNING: Failed to export channel {entry['channel_name']}, skipping.")
+            return None
 
     return json_path
 
@@ -223,15 +258,45 @@ def get_unique_path(filepath: Path) -> Path:
 
 
 def download_file(url: str, dest: Path):
-    """Download a file from URL to destination path."""
+    """Download a file to dest using a .tmp intermediate. Returns True on success."""
+    tmp_dest = dest.with_suffix(dest.suffix + ".tmp")
     try:
         resp = requests.get(url, stream=True, timeout=60)
         resp.raise_for_status()
-        with open(dest, "wb") as f:
+        with open(tmp_dest, "wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
                 f.write(chunk)
+        tmp_dest.rename(dest)
+        return True
     except requests.RequestException as e:
         print(f"    Failed to download {url}: {e}")
+        tmp_dest.unlink(missing_ok=True)
+        return False
+
+
+def make_download_filename(message_id: str, original_filename: str) -> str:
+    """Build the download filename prefixed with message ID."""
+    stem = Path(original_filename).stem[:50]
+    ext = Path(original_filename).suffix
+    return f"{message_id}_{stem}{ext}"
+
+
+def cleanup_tmp_files(directory: Path):
+    """Remove leftover .tmp files from interrupted downloads."""
+    if not directory.exists():
+        return
+    for tmp_file in directory.glob("*.tmp"):
+        print(f"    Removing incomplete download: {tmp_file.name}")
+        tmp_file.unlink()
+
+
+def is_message_already_downloaded(download_dir: Path, message_id: str) -> bool:
+    """Check if any file in download_dir starts with the message ID prefix."""
+    prefix = f"{message_id}_"
+    for f in download_dir.iterdir():
+        if f.name.startswith(prefix) and not f.name.endswith(".tmp"):
+            return True
+    return False
 
 
 def download_media_from_json(json_path: Path, entry: dict):
@@ -247,11 +312,28 @@ def download_media_from_json(json_path: Path, entry: dict):
         return
 
     messages = data.get("messages", [])
-    download_dir = OUTPUT_DIR / f"{entry['guild_name']}_{entry['channel_name']}"
+    download_dir = OUTPUT_DIR / entry['guild_name'] / entry['channel_name']
     download_dir.mkdir(parents=True, exist_ok=True)
 
+    # Clean up any .tmp files from interrupted previous runs
+    cleanup_tmp_files(download_dir)
+
+    # Build set of existing message IDs to skip already-downloaded
+    existing_message_ids: set[str] = set()
+    for f in download_dir.iterdir():
+        if not f.name.endswith(".tmp") and "_" in f.name:
+            existing_message_ids.add(f.name.split("_", 1)[0])
+
     downloaded = 0
+    skipped = 0
     for message in messages:
+        message_id = message.get("id", "")
+
+        # Skip entire message if already downloaded
+        if message_id in existing_message_ids:
+            skipped += 1
+            continue
+
         # Check attachments
         for attachment in message.get("attachments", []):
             url = attachment.get("url", "")
@@ -260,11 +342,12 @@ def download_media_from_json(json_path: Path, entry: dict):
                 parsed = urlparse(url)
                 filename = Path(parsed.path).name
             if is_media_file(filename):
-                dest = get_unique_path(download_dir / filename)
+                dest_name = make_download_filename(message_id, filename)
+                dest = get_unique_path(download_dir / dest_name)
                 if not dest.exists():
-                    print(f"    Downloading: {filename}")
-                    download_file(url, dest)
-                    downloaded += 1
+                    print(f"    Downloading: {dest_name}")
+                    if download_file(url, dest):
+                        downloaded += 1
 
         # Check embeds with media
         for embed in message.get("embeds", []):
@@ -275,11 +358,12 @@ def download_media_from_json(json_path: Path, entry: dict):
                     parsed = urlparse(url)
                     filename = Path(parsed.path).name
                     if is_media_file(filename):
-                        dest = get_unique_path(download_dir / filename)
+                        dest_name = make_download_filename(message_id, filename)
+                        dest = get_unique_path(download_dir / dest_name)
                         if not dest.exists():
-                            print(f"    Downloading: {filename}")
-                            download_file(url, dest)
-                            downloaded += 1
+                            print(f"    Downloading: {dest_name}")
+                            if download_file(url, dest):
+                                downloaded += 1
 
         # Check content for direct URLs
         content = message.get("content", "")
@@ -288,13 +372,16 @@ def download_media_from_json(json_path: Path, entry: dict):
             parsed = urlparse(url)
             filename = Path(parsed.path).name
             if is_media_file(filename):
-                dest = get_unique_path(download_dir / filename)
+                dest_name = make_download_filename(message_id, filename)
+                dest = get_unique_path(download_dir / dest_name)
                 if not dest.exists():
-                    print(f"    Downloading: {filename}")
-                    download_file(url, dest)
-                    downloaded += 1
+                    print(f"    Downloading: {dest_name}")
+                    if download_file(url, dest):
+                        downloaded += 1
 
     print(f"  Downloaded {downloaded} media files to {download_dir}")
+    if skipped:
+        print(f"  Skipped {skipped} already-downloaded messages.")
 
 
 def main():
@@ -326,8 +413,9 @@ def main():
         # Export messages
         json_path = export_channel(entry)
 
-        # Download media
-        download_media_from_json(json_path, entry)
+        # Download media (skip if export failed and no existing JSON)
+        if json_path:
+            download_media_from_json(json_path, entry)
 
     print("\nDone!")
 
